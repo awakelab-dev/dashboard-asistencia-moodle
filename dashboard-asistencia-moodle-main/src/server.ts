@@ -396,15 +396,29 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
 
     const groupsByUsername = new Map<string, string>();
     const userIdToUsername = new Map<number, string>();
+    const fullNameByUsername = new Map<string, string>();
+    const userAliasToUsername = new Map<string, string>();
+    const normalizeUserKey = (value: any): string => String(value ?? '').trim().toLowerCase();
 
     // Mapeo de grupos...
     for (const u of enrolledList) {
-      const uname = String(u?.username ?? '').toLowerCase().trim();
+      const uname = normalizeUserKey(u?.username);
+      const fullName = String(
+        u?.fullname ??
+        `${String(u?.firstname ?? '').trim()} ${String(u?.lastname ?? '').trim()}`.trim()
+      ).trim();
+      const emailKey = normalizeUserKey(u?.email);
       if (u.id && uname) userIdToUsername.set(u.id, uname);
       let gname = 'Sin Grupo';
       const gs = Array.isArray(u?.groups) ? u.groups : [];
       if (gs.length > 0) gname = String(gs[0]?.name ?? 'Sin Grupo');
-      if (uname) groupsByUsername.set(uname, gname);
+      if (uname) {
+        groupsByUsername.set(uname, gname);
+        fullNameByUsername.set(uname, fullName || uname);
+        userAliasToUsername.set(uname, uname);
+        if (fullName) userAliasToUsername.set(normalizeUserKey(fullName), uname);
+        if (emailKey) userAliasToUsername.set(emailKey, uname);
+      }
     }
 
     // Obtener grupos profundos
@@ -442,12 +456,18 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
 
     // Estructuras
     type DayItem = { fecha: string; minutos: number; firstTs: number; lastTs: number; entrada?: string; salida?: string; };
-    type UserAgg = { usuario: string; groupName: string; minutosTotales: number; diasDetalle: DayItem[] };
+    type UserAgg = { usuario: string; nombre: string; groupName: string; minutosTotales: number; diasDetalle: DayItem[] };
     const byUser = new Map<string, UserAgg>();
 
     // Inicializar usuarios
     groupsByUsername.forEach((groupName, username) => {
-      byUser.set(username, { usuario: username, groupName: groupName, minutosTotales: 0, diasDetalle: [] });
+      byUser.set(username, {
+        usuario: username,
+        nombre: fullNameByUsername.get(username) || username,
+        groupName: groupName,
+        minutosTotales: 0,
+        diasDetalle: []
+      });
     });
 
     const usernameIdx = 0;
@@ -533,13 +553,14 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       }
       if (!user) continue;
 
-      const userKey = user.toLowerCase();
+      const rawUserKey = normalizeUserKey(user);
+      const userKey = userAliasToUsername.get(rawUserKey) || rawUserKey;
       if (!byUser.has(userKey)) {
-        if (rows.indexOf(row) < 5) console.log(`DEBUG: User not in enrolled list: "${userKey}"`);
+        if (rows.indexOf(row) < 5) console.log(`DEBUG: User not in enrolled list: raw="${rawUserKey}" resolved="${userKey}"`);
         continue;
       }
 
-      console.log(`DEBUG: Processing row for user "${userKey}" course "${courseVal}"`);
+      console.log(`DEBUG: Processing row for user "${rawUserKey}" as "${userKey}" course "${courseVal}"`);
       const agg = byUser.get(userKey)!;
 
       // Parse last access date (Col 2) - English format with AM/PM
@@ -682,7 +703,7 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
     // Agrupamos documentos duplicados o fragmentados del mismo usuario
     const userMap = new Map<string, any>();
     allUsersRaw.forEach(u => {
-      const key = String(u.usuario || u.userName || '').toLowerCase().trim();
+      const key = String(u.usuario || u.userName || u.nombre || '').toLowerCase().trim();
       if (!key) return;
       if (!userMap.has(key)) {
         userMap.set(key, { ...u, diasDetalle: [...(u.diasDetalle || [])] });
@@ -717,7 +738,7 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
     if (userQuery) {
       const q = String(userQuery).toLowerCase().trim();
       allUsers = allUsers.filter((u: any) => {
-        const nombre = (u.usuario || u.nombre || '').toLowerCase();
+        const nombre = (u.nombre || u.usuario || '').toLowerCase();
         return nombre.includes(q);
       });
     }
@@ -755,7 +776,7 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
         if (finG) finG.setHours(23, 59, 59, 999);
 
         const base: any = {
-          nombre: user.usuario || user.nombre || 'Sin Nombre',
+          nombre: user.nombre || user.usuario || 'Sin Nombre',
           grupo: gName,
           Lunes: 0, Martes: 0, Miércoles: 0, Jueves: 0, Viernes: 0,
           totalSemana: 0,
@@ -941,7 +962,7 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
       for (const user of groupUsers) {
         const row = ws.getRow(currentRow);
         row.getCell(1).value = user.dni || '             ';
-        row.getCell(2).value = (user.usuario || user.nombre || 'Sin Nombre').toUpperCase();
+        row.getCell(2).value = (user.nombre || user.usuario || 'Sin Nombre').toUpperCase();
 
         diasSemana.forEach((dia, index) => {
           const colLetter = colMap[index];
@@ -1023,7 +1044,7 @@ app.get('/api/reports/daily-export', async (req: any, res: any) => {
     // --- CONSOLIDACIÓN DE DATOS DIARIOS ---
     const userMap = new Map<string, any>();
     allUsersRaw.forEach(u => {
-      const key = String(u.usuario || u.userName || '').toLowerCase().trim();
+      const key = String(u.usuario || u.userName || u.nombre || '').toLowerCase().trim();
       if (!key) return;
       if (!userMap.has(key)) {
         userMap.set(key, { ...u });
@@ -1087,7 +1108,7 @@ app.get('/api/reports/daily-export', async (req: any, res: any) => {
     const currentD = new Date(dateQuery + 'T12:00:00');
 
     for (const user of users) {
-      const nombre = user.usuario || user.nombre || 'Sin Nombre';
+      const nombre = user.nombre || user.usuario || 'Sin Nombre';
       const rawGroup = (user.groupName ?? user.grupo ?? user.group);
       const grupo = (typeof rawGroup === 'string' && rawGroup.trim()) ? rawGroup.trim() : 'Sin Grupo';
 
