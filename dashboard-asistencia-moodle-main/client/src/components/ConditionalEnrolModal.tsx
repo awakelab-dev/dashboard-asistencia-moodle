@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { Modal, Button, Form, Table, Spinner, Alert, Badge } from 'react-bootstrap';
 
@@ -33,6 +33,28 @@ export function ConditionalEnrolModal({ show, onHide, destCourse }: ConditionalE
     const [sourceCourseId, setSourceCourseId] = useState<number | ''>('');
     const [roleId] = useState<number>(5); // Default: student
     const [error, setError] = useState('');
+
+    // Course search
+    const [searchQuery, setSearchQuery] = useState('');
+    const [showDropdown, setShowDropdown] = useState(false);
+    const searchRef = useRef<HTMLDivElement>(null);
+
+    const filteredCourses = moodleCourses.filter(c =>
+        c.shortname.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        c.fullname.toLowerCase().includes(searchQuery.toLowerCase())
+    );
+
+    const selectedCourse = moodleCourses.find(c => c.id === Number(sourceCourseId));
+
+    useEffect(() => {
+        const handleClickOutside = (e: MouseEvent) => {
+            if (searchRef.current && !searchRef.current.contains(e.target as Node)) {
+                setShowDropdown(false);
+            }
+        };
+        document.addEventListener('mousedown', handleClickOutside);
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+    }, []);
 
     useEffect(() => {
         if (show && destCourse) {
@@ -85,6 +107,7 @@ export function ConditionalEnrolModal({ show, onHide, destCourse }: ConditionalE
                 const rulesRes = await axios.get(`/api/moodle/conditional-rules/${destCourse.courseId}`);
                 if (rulesRes.data.ok) setRules(rulesRes.data.rules);
                 setSourceCourseId('');
+                setSearchQuery('');
             }
         } catch (err: any) {
             const msg = err.response?.data?.error || err.message || 'Error desconocido';
@@ -141,21 +164,73 @@ export function ConditionalEnrolModal({ show, onHide, destCourse }: ConditionalE
                     <Form.Group className="mb-2">
                         <Form.Label className="small fw-bold text-muted mb-2">CURSO ORIGEN (El alumno debe completar este curso primero):</Form.Label>
                         <div className="d-flex gap-3">
-                            <div className="flex-grow-1">
-                                <Form.Control
-                                    as="select"
-                                    className="form-control-premium shadow-none"
-                                    value={sourceCourseId}
-                                    onChange={(e) => setSourceCourseId(Number(e.target.value))}
-                                    disabled={saving || loading}
-                                >
-                                    <option value="">-- Buscar y seleccionar curso --</option>
-                                    {moodleCourses.map(c => (
-                                        <option key={c.id} value={c.id}>
-                                            {c.shortname} | {c.fullname.length > 60 ? c.fullname.substring(0, 60) + '...' : c.fullname}
-                                        </option>
-                                    ))}
-                                </Form.Control>
+                            <div className="flex-grow-1 position-relative" ref={searchRef}>
+                                <div className="input-group">
+                                    <span className="input-group-text bg-white border-end-0" style={{ borderRadius: '8px 0 0 8px' }}>
+                                        <i className="fa-solid fa-magnifying-glass text-muted" style={{ fontSize: '0.85rem' }}></i>
+                                    </span>
+                                    <Form.Control
+                                        type="text"
+                                        className="form-control-premium shadow-none border-start-0"
+                                        style={{ borderRadius: '0 8px 8px 0' }}
+                                        placeholder={selectedCourse ? `${selectedCourse.shortname} | ${selectedCourse.fullname.length > 50 ? selectedCourse.fullname.substring(0, 50) + '...' : selectedCourse.fullname}` : '-- Buscar y seleccionar curso --'}
+                                        value={showDropdown ? searchQuery : (selectedCourse ? '' : '')}
+                                        onChange={(e) => {
+                                            setSearchQuery(e.target.value);
+                                            setShowDropdown(true);
+                                            if (e.target.value === '') setSourceCourseId('');
+                                        }}
+                                        onFocus={() => {
+                                            setSearchQuery('');
+                                            setShowDropdown(true);
+                                        }}
+                                        disabled={saving || loading}
+                                    />
+                                    {sourceCourseId && (
+                                        <button
+                                            type="button"
+                                            className="btn btn-outline-secondary border-start-0"
+                                            style={{ borderRadius: '0 8px 8px 0', marginLeft: '-1px' }}
+                                            onClick={() => { setSourceCourseId(''); setSearchQuery(''); setShowDropdown(false); }}
+                                            title="Limpiar selección"
+                                        >
+                                            <i className="fa-solid fa-xmark text-muted" style={{ fontSize: '0.8rem' }}></i>
+                                        </button>
+                                    )}
+                                </div>
+
+                                {showDropdown && (
+                                    <div
+                                        className="position-absolute w-100 bg-white border rounded-3 shadow-lg"
+                                        style={{ zIndex: 9999, top: 'calc(100% + 4px)', maxHeight: '260px', overflowY: 'auto' }}
+                                    >
+                                        {loading ? (
+                                            <div className="text-center py-3">
+                                                <Spinner size="sm" animation="border" variant="secondary" />
+                                            </div>
+                                        ) : filteredCourses.length === 0 ? (
+                                            <div className="px-3 py-2 text-muted small">No se encontraron cursos.</div>
+                                        ) : (
+                                            filteredCourses.map(c => (
+                                                <div
+                                                    key={c.id}
+                                                    className="px-3 py-2 cursor-pointer"
+                                                    style={{ cursor: 'pointer', borderBottom: '1px solid #f1f5f9', fontSize: '0.88rem' }}
+                                                    onMouseEnter={e => (e.currentTarget.style.background = '#f0f7ff')}
+                                                    onMouseLeave={e => (e.currentTarget.style.background = '')}
+                                                    onMouseDown={() => {
+                                                        setSourceCourseId(c.id);
+                                                        setSearchQuery('');
+                                                        setShowDropdown(false);
+                                                    }}
+                                                >
+                                                    <span className="fw-semibold text-primary me-2">{c.shortname}</span>
+                                                    <span className="text-dark">{c.fullname.length > 70 ? c.fullname.substring(0, 70) + '...' : c.fullname}</span>
+                                                </div>
+                                            ))
+                                        )}
+                                    </div>
+                                )}
                             </div>
                             <Button className="btn-premium px-4" onClick={handleSave} disabled={!sourceCourseId || saving}>
                                 {saving ? <Spinner size="sm" animation="border" /> : <><i className="fa-solid fa-magic me-2"></i> Activar</>}
