@@ -555,18 +555,6 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       return 0;
     };
 
-    // Pre-calcular sessionMinutes y límites del horario (constantes para todo el proceso)
-    const schedParts = horarioCurso.split('-').map((p: string) => p.trim());
-    let sessionMinutes = MINUTOS_OBJETIVO_DIARIO;
-    if (schedParts.length === 2) {
-      const [sh, sm] = schedParts[0].split(':').map(Number);
-      const [eh, em] = schedParts[1].split(':').map(Number);
-      const scheduleMinutes = (eh * 60 + em) - (sh * 60 + sm);
-      sessionMinutes = Math.min(scheduleMinutes > 0 ? scheduleMinutes : MINUTOS_OBJETIVO_DIARIO, MINUTOS_OBJETIVO_DIARIO);
-    }
-    const schedHoraInicio = schedParts.length === 2 ? parseFloat(schedParts[0].replace('H', '').replace(':', '.')) : 0;
-    const schedHoraFin = schedParts.length === 2 ? parseFloat(schedParts[1].replace('H', '').replace(':', '.')) : 24;
-
     for (const row of rows) {
       const cells = row.columns || [];
       const user = toText(cells[usernameIdx]).trim();
@@ -685,17 +673,7 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
 
       userAgg.diasDetalle.forEach((dia) => {
         const eventos = (dia.events && dia.events.length) ? dia.events : [dia.firstTs];
-        let minutosReales: number;
-
-        if (eventos.length >= 2) {
-          // Varios eventos del día: reconstrucción REAL de sesiones (algoritmo Dedication).
-          minutosReales = reconstruirMinutosSesion(eventos, horarioCurso);
-        } else {
-          // Un solo evento (caso típico con lastcourseaccess): la duración real es
-          // desconocida. Se otorga crédito completo si el acceso cae dentro del horario.
-          const accessHour = new Date(dia.firstTs).getHours() + new Date(dia.firstTs).getMinutes() / 60;
-          minutosReales = (accessHour >= schedHoraInicio && accessHour <= schedHoraFin) ? sessionMinutes : 0;
-        }
+        const minutosReales = reconstruirMinutosSesion(eventos, horarioCurso);
 
         dia.minutos = minutosReales;
         totalUsuario += minutosReales;
