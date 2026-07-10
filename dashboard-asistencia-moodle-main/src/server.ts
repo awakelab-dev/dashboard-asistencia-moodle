@@ -18,7 +18,7 @@ app.use((req, res, next) => {
   next();
 });
 
-console.log("✅ [ANTIGRAVITY-1.1] SISTEMA DE RUTAS PREPARADO");
+console.log("✅ [DASHBOARD-ASISTENCIA-2.0] SISTEMA DE RUTAS PREPARADO");
 
 const PORT = process.env.PORT || 3000;
 const MOODLE_URL = process.env.MOODLE_URL;
@@ -444,6 +444,43 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       }
     } catch (errGroup) { console.warn("Warn grupos:", errGroup); }
 
+    // Red de seguridad: si el curso tiene reglas condicionales, heredar grupos de cada curso
+    // origen para los alumnos que Moodle matriculó automáticamente (y que pueden no tener grupo
+    // en este curso). Es no-fatal: si falla, el sync continúa normalmente.
+    try {
+      const rulesResp = await axios.get(moodleConfig.wsUrl, {
+        params: {
+          wstoken: moodleConfig.moodleToken,
+          wsfunction: 'enrol_courseapproval_get_instances',
+          moodlewsrestformat: 'json',
+          courseid: moodleCourseId
+        }
+      });
+      const condRules: any[] = Array.isArray(rulesResp.data) ? rulesResp.data : [];
+      if (condRules.length > 0) {
+        const destUserIds = enrolledList.map((u: any) => Number(u.id));
+        for (const rule of condRules) {
+          if (rule.sourcecourseid) {
+            try {
+              const gs = await inheritGroupsForUsers(
+                moodleConfig, Number(rule.sourcecourseid), Number(moodleCourseId), destUserIds, { preCreateAllGroups: true }
+              );
+              if (gs.groupsCreated > 0 || gs.membershipsAdded > 0) {
+                console.log(`👥 Sync grupos (regla condicional src=${rule.sourcecourseid}): ${gs.groupsCreated} creados, ${gs.membershipsAdded} membresías`);
+              }
+            } catch (eRule: any) {
+              console.warn(`⚠️ No se pudieron sincronizar grupos desde curso origen ${rule.sourcecourseid}:`, eRule?.message || eRule);
+            }
+          }
+        }
+      }
+    } catch (eCondRules: any) {
+      // enrol_courseapproval puede no estar instalado — ignorar silenciosamente
+      if (!String(eCondRules?.message || '').includes('accessexception')) {
+        console.warn('⚠️ No se pudieron consultar reglas condicionales para sync de grupos:', eCondRules?.message || eCondRules);
+      }
+    }
+
     // Obtener Reporte de Logs
     const moodleRaw = await axios.post(moodleConfig.wsUrl, null, {
       params: {
@@ -720,6 +757,50 @@ const formatSimpleHours = (minutes: number) => {
   return `${h}:${m.toString().padStart(2, '0')}`;
 };
 
+// Helper: obtiene el set de usernames actualmente matriculados en Moodle para un curso.
+// Devuelve null si no se pudo consultar (fallo de red, token, etc.) para que el caller
+// pueda decidir si continuar sin filtro o abortar.
+async function getEnrolledUsernames(db: any, courseId: string | number): Promise<Set<string> | null> {
+  try {
+    const moodleConfig = await getMoodleAccessConfig(db, String(courseId));
+    // Resolver el ID numérico del curso en Moodle
+    let moodleCourseId: any = moodleConfig.courseConfig?.courseId ?? courseId;
+    if (isNaN(Number(moodleCourseId))) {
+      const allCoursesResp = await axios.get(moodleConfig.wsUrl, {
+        params: { wstoken: moodleConfig.moodleToken, wsfunction: 'core_course_get_courses', moodlewsrestformat: 'json' },
+        timeout: 15000
+      });
+      const match = (Array.isArray(allCoursesResp.data) ? allCoursesResp.data : [])
+        .find((c: any) => c.shortname === String(courseId));
+      if (match) moodleCourseId = match.id;
+    }
+    const resp = await axios.get(moodleConfig.wsUrl, {
+      params: {
+        wstoken: moodleConfig.moodleToken,
+        wsfunction: 'core_enrol_get_enrolled_users',
+        moodlewsrestformat: 'json',
+        courseid: moodleCourseId
+      },
+      timeout: 15000
+    });
+    if (!Array.isArray(resp.data)) return null;
+    const set = new Set<string>();
+    for (const u of resp.data) {
+      const uname = String(u.username ?? '').trim().toLowerCase();
+      if (uname) set.add(uname);
+      // También indexar por fullname y email para matcheo flexible
+      const fullname = String(u.fullname ?? `${u.firstname ?? ''} ${u.lastname ?? ''}`.trim()).trim().toLowerCase();
+      if (fullname) set.add(fullname);
+      const email = String(u.email ?? '').trim().toLowerCase();
+      if (email) set.add(email);
+    }
+    return set;
+  } catch (e: any) {
+    console.warn('⚠️ No se pudo obtener matriculados de Moodle para filtrar reporte:', e?.message || e);
+    return null;
+  }
+}
+
 // Export Semanal (Excel Oficial + Vista Previa JSON) - CON VALIDACIÓN DE FECHAS DE GRUPO
 app.get('/api/reports/weekly-export', async (req: any, res: any) => {
   try {
@@ -777,6 +858,21 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
     });
 
     let allUsers = Array.from(userMap.values());
+
+    // Filtrar alumnos fantasma: solo mantener los actualmente matriculados en Moodle.
+    const enrolledSet = await getEnrolledUsernames(db, courseId);
+    if (enrolledSet) {
+      const beforeCount = allUsers.length;
+      allUsers = allUsers.filter((u: any) => {
+        const uKey = String(u.usuario || u.userName || '').toLowerCase().trim();
+        const uName = String(u.nombre || '').toLowerCase().trim();
+        return enrolledSet.has(uKey) || enrolledSet.has(uName);
+      });
+      const removed = beforeCount - allUsers.length;
+      if (removed > 0) {
+        console.log(`🧹 Weekly export: ${removed} alumno(s) fantasma filtrado(s) (no matriculados en Moodle)`);
+      }
+    }
 
     if (groupId && groupId !== 'todos') {
       const targetGroupSetting = allSettings.find(s => String(s.groupId) === String(groupId));
@@ -1116,6 +1212,21 @@ app.get('/api/reports/daily-export', async (req: any, res: any) => {
     });
 
     let users = Array.from(userMap.values());
+
+    // Filtrar alumnos fantasma: solo mantener los actualmente matriculados en Moodle.
+    const enrolledSet = await getEnrolledUsernames(db, courseId);
+    if (enrolledSet) {
+      const beforeCount = users.length;
+      users = users.filter((u: any) => {
+        const uKey = String(u.usuario || u.userName || '').toLowerCase().trim();
+        const uName = String(u.nombre || '').toLowerCase().trim();
+        return enrolledSet.has(uKey) || enrolledSet.has(uName);
+      });
+      const removed = beforeCount - users.length;
+      if (removed > 0) {
+        console.log(`🧹 Daily export: ${removed} alumno(s) fantasma filtrado(s) (no matriculados en Moodle)`);
+      }
+    }
 
     const defaultMin = Number(courseInfo?.minMinutes || 170);
     const defaultSchedule = courseInfo?.scheduleTime || "00:00 - 23:59";
@@ -2110,17 +2221,23 @@ app.get('/api/moodle/enrolled-users/:courseId', async (req: any, res: any) => {
 // Helper: hereda los grupos del curso origen al curso destino para los usuarios indicados.
 // Por cada grupo del origen donde esté el usuario, crea (si falta) un grupo con el mismo
 // nombre en el destino y añade al usuario. No es fatal: si algo falla, la inscripción se mantiene.
+// Opciones:
+//   preCreateAllGroups: true → crea TODOS los grupos del origen en el destino aunque no haya
+//     usuarios relevantes (útil para reglas condicionales donde los alumnos llegarán después).
 async function inheritGroupsForUsers(
   moodleConfig: any,
   sourceCourseId: number,
   destCourseId: number,
-  userIds: number[]
+  userIds: number[],
+  opts?: { preCreateAllGroups?: boolean }
 ): Promise<{ groupsCreated: number; membershipsAdded: number }> {
   const summary = { groupsCreated: 0, membershipsAdded: 0 };
-  if (!sourceCourseId || !destCourseId || !Array.isArray(userIds) || userIds.length === 0) {
-    return summary;
-  }
-  const userIdSet = new Set(userIds.map(Number));
+  const preCreate = opts?.preCreateAllGroups ?? false;
+
+  if (!sourceCourseId || !destCourseId) return summary;
+  if (!preCreate && (!Array.isArray(userIds) || userIds.length === 0)) return summary;
+
+  const userIdSet = new Set((userIds || []).map(Number));
 
   // 1. Grupos del curso origen.
   const srcGroupsResp = await axios.get(moodleConfig.wsUrl, {
@@ -2134,7 +2251,7 @@ async function inheritGroupsForUsers(
   const srcGroups: any[] = Array.isArray(srcGroupsResp.data) ? srcGroupsResp.data : [];
   if (srcGroups.length === 0) return summary;
 
-  // 2. Miembros de cada grupo del origen.
+  // 2. Miembros de cada grupo del origen (para asignar usuarios al destino).
   const memberParams: any = {};
   srcGroups.forEach((g: any, i: number) => { memberParams[`groupids[${i}]`] = g.id; });
   const membersResp = await axios.get(moodleConfig.wsUrl, {
@@ -2153,7 +2270,9 @@ async function inheritGroupsForUsers(
     const relevant = (m.userids || []).map(Number).filter((uid: number) => userIdSet.has(uid));
     if (relevant.length > 0) relevantByGroup.set(Number(m.groupid), relevant);
   });
-  if (relevantByGroup.size === 0) return summary;
+
+  // Si no hay usuarios relevantes y no se pidió pre-crear, salir
+  if (relevantByGroup.size === 0 && !preCreate) return summary;
 
   // 3. Grupos existentes en el destino (nombre -> id).
   const destGroupsResp = await axios.get(moodleConfig.wsUrl, {
@@ -2174,7 +2293,12 @@ async function inheritGroupsForUsers(
   // 4. Asegurar grupo destino por nombre (crear si falta) y juntar membresías a añadir.
   const membersToAdd: { groupid: number; userid: number }[] = [];
 
-  for (const [srcGroupId, relevantUsers] of relevantByGroup.entries()) {
+  // Decidir qué grupos del origen iterar: si preCreate, TODOS; si no, solo los que tengan usuarios.
+  const groupIdsToProcess: number[] = preCreate
+    ? srcGroups.map((g: any) => Number(g.id))
+    : Array.from(relevantByGroup.keys());
+
+  for (const srcGroupId of groupIdsToProcess) {
     const srcGroup = srcGroupById.get(srcGroupId);
     if (!srcGroup) continue;
 
@@ -2200,7 +2324,11 @@ async function inheritGroupsForUsers(
       }
     }
 
-    relevantUsers.forEach((uid) => membersToAdd.push({ groupid: destGroupId as number, userid: uid }));
+    // Añadir membresías solo si hay usuarios relevantes en este grupo
+    const relevantUsers = relevantByGroup.get(srcGroupId);
+    if (relevantUsers) {
+      relevantUsers.forEach((uid) => membersToAdd.push({ groupid: destGroupId as number, userid: uid }));
+    }
   }
 
   // 5. Añadir miembros en lote.
@@ -2462,7 +2590,36 @@ app.post('/api/moodle/conditional-rules', async (req: any, res: any) => {
       return res.status(400).json({ ok: false, error: response.data.message });
     }
 
-    res.json({ ok: true, instanceId: response.data });
+    // Heredar grupos del curso origen al destino.
+    // 1) Pre-crear los grupos del origen en el destino (para que existan cuando se matriculen alumnos).
+    // 2) Si ya hay alumnos matriculados en ambos cursos, asignarlos a sus grupos correspondientes.
+    let groupSync: { groupsCreated: number; membershipsAdded: number } | undefined;
+    const warnings: string[] = [];
+    try {
+      // Obtener alumnos matriculados en el curso destino
+      const enrolledDestResp = await axios.get(moodleConfig.wsUrl, {
+        params: {
+          wstoken: moodleConfig.moodleToken,
+          wsfunction: 'core_enrol_get_enrolled_users',
+          moodlewsrestformat: 'json',
+          courseid: courseId
+        }
+      });
+      const destUsers: any[] = Array.isArray(enrolledDestResp.data) ? enrolledDestResp.data : [];
+      const destUserIds = destUsers.map((u: any) => Number(u.id));
+
+      // inheritGroupsForUsers con preCreateAllGroups: crea TODOS los grupos del origen en el
+      // destino aunque no haya alumnos aún, y asigna membresías para los que ya estén en ambos.
+      groupSync = await inheritGroupsForUsers(moodleConfig, Number(sourceCourseId), Number(courseId), destUserIds, { preCreateAllGroups: true });
+      if (groupSync.groupsCreated > 0 || groupSync.membershipsAdded > 0) {
+        console.log(`👥 Regla condicional: grupos heredados: ${groupSync.groupsCreated} creados, ${groupSync.membershipsAdded} membresías añadidas`);
+      }
+    } catch (e: any) {
+      console.log('⚠️ Regla condicional: no se pudieron heredar grupos del curso origen:', e?.message || e);
+      warnings.push('La regla se creó, pero no se pudieron heredar todos los grupos del curso origen.');
+    }
+
+    res.json({ ok: true, instanceId: response.data, groupSync, warnings: warnings.length > 0 ? warnings : undefined });
   } catch (error: any) {
     console.error('❌ Error agregando regla condicional:', error.message);
     res.status(500).json({ ok: false, error: 'Error al conectar con Moodle' });
@@ -2503,7 +2660,7 @@ app.delete('/api/moodle/conditional-rules/:instanceId', async (req: any, res: an
 
 // Ruta de prueba final para verificar despliegue
 app.get('/api/ping', (req, res) => {
-  res.json({ ok: true, message: 'pong (ANTIGRAVITY-1.1)', time: new Date().toISOString() });
+  res.json({ ok: true, message: 'pong (DASHBOARD-ASISTENCIA-2.0)', time: new Date().toISOString() });
 });
 
 // =============================================
@@ -2721,11 +2878,11 @@ app.delete('/api/auth/users/:username', async (req: any, res: any) => {
 // Middleware para capturar rutas no encontradas y logearlas
 app.use((req, res) => {
   console.log(`❗ [404 NOT FOUND] ${req.method} ${req.url}`);
-  res.status(404).send(`La ruta ${req.url} no existe en este servidor (ANTIGRAVITY-1.1)`);
+  res.status(404).send(`La ruta ${req.url} no existe en este servidor (DASHBOARD-ASISTENCIA-2.0)`);
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 [ANTIGRAVITY-1.0] Servidor corriendo en http://localhost:${PORT}`);
+  console.log(`🚀 [DASHBOARD-ASISTENCIA-2.0] Servidor corriendo en http://localhost:${PORT}`);
 });
 
 async function initAdminUser() {

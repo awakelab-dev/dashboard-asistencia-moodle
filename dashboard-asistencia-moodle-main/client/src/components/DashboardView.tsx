@@ -468,6 +468,18 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
         }
     };
 
+    // Sync silencioso: actualiza datos de Moodle en background sin bloquear la UI.
+    // Se usa al abrir modales para que trabajen con datos frescos.
+    const syncCourseInBackground = (course: RegisteredCourse) => {
+        axios.get(`/api/dailystats/${course.courseId}`, {
+            params: { courseShortname: course.shortname }
+        }).then(() => {
+            console.log(`🔄 Sync background OK: ${course.shortname}`);
+        }).catch((err) => {
+            console.warn(`⚠️ Sync background falló para ${course.shortname}:`, err?.message);
+        });
+    };
+
     const handleCardClick = async (course: RegisteredCourse) => {
         setSyncingId(course.courseId);
         try {
@@ -574,17 +586,17 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
                                         <div className="d-flex gap-3 bg-light rounded px-2 py-1">
                                             <i className="fa-solid fa-user-plus text-primary icon-hover icon-blue-hover"
                                                 style={{ cursor: 'pointer', fontSize: '1rem' }}
-                                                onClick={(e) => { e.stopPropagation(); setEnrolTargetCourse(c); setShowEnrolModal(true); }}
+                                                onClick={(e) => { e.stopPropagation(); syncCourseInBackground(c); setEnrolTargetCourse(c); setShowEnrolModal(true); }}
                                                 title="Inscripción Masiva"
                                             ></i>
                                             <i className="fa-solid fa-diagram-project text-success icon-hover"
                                                 style={{ cursor: 'pointer', fontSize: '1rem' }}
-                                                onClick={(e) => { e.stopPropagation(); setConditionalTargetCourse(c); setShowConditionalModal(true); }}
+                                                onClick={(e) => { e.stopPropagation(); syncCourseInBackground(c); setConditionalTargetCourse(c); setShowConditionalModal(true); }}
                                                 title="Inscripción Condicional"
                                             ></i>
                                             <i className="fa-solid fa-gear text-secondary icon-hover"
                                                 style={{ cursor: 'pointer', fontSize: '1rem' }}
-                                                onClick={(e) => handleOpenGroupsManager(c, e)}
+                                                onClick={(e) => { syncCourseInBackground(c); handleOpenGroupsManager(c, e); }}
                                                 title="Configurar Grupos"
                                             ></i>
                                             <i className="fa-regular fa-trash-can text-danger icon-hover icon-delete-hover"
