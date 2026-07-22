@@ -375,9 +375,23 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       return res.status(400).json({ error: 'courseId es requerido.' });
     }
 
-    // Si no hay horario definido, usamos un default amplio (ej: 00:00 - 23:59)
-    const horarioCurso = courseConfig?.scheduleTime || "00:00 - 23:59";
-    console.log(`🕒 Aplicando horario de corte: ${horarioCurso}`);
+    // Horario por defecto del curso (fallback si el grupo no tiene uno propio)
+    const horarioCursoDefault = courseConfig?.scheduleTime || "00:00 - 23:59";
+    console.log(`🕒 Horario de corte por defecto del curso: ${horarioCursoDefault}`);
+
+    // Cargar configuraciones de grupo para aplicar horarios específicos por grupo
+    const allGroupSettings: AttendanceSettingsDoc[] = await db
+      .collection<AttendanceSettingsDoc>('attendanceSettings')
+      .find({ courseId: String(courseId) })
+      .toArray();
+    // Mapa groupName -> scheduleTime para lookup rápido
+    const scheduleByGroupName = new Map<string, string>();
+    allGroupSettings.forEach(gs => {
+      if (gs.groupName && gs.scheduleTime) {
+        scheduleByGroupName.set(gs.groupName.toLowerCase().trim(), gs.scheduleTime);
+      }
+    });
+    console.log(`📋 Horarios por grupo cargados: ${scheduleByGroupName.size} grupos con horario propio`);
 
     let moodleCourseId: any = courseConfig?.courseId ?? normalizedCourseId;
 
@@ -481,23 +495,37 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       }
     }
 
-    // Obtener Reporte de Logs
-    const moodleRaw = await axios.post(moodleConfig.wsUrl, null, {
-      params: {
-        wstoken: moodleConfig.moodleToken,
-        wsfunction: 'core_reportbuilder_retrieve_report',
-        moodlewsrestformat: 'json',
-        reportid: 12,
-        perpage: 1000
-      }
-    });
+    // Obtener Reporte de Logs — con paginación para no perder datos en cursos grandes
+    const REPORT_PAGE_SIZE = 1000;
+    let rows: any[] = [];
+    let currentPage = 0;
+    let hasMorePages = true;
+    while (hasMorePages) {
+      const moodleRaw = await axios.post(moodleConfig.wsUrl, null, {
+        params: {
+          wstoken: moodleConfig.moodleToken,
+          wsfunction: 'core_reportbuilder_retrieve_report',
+          moodlewsrestformat: 'json',
+          reportid: 12,
+          perpage: REPORT_PAGE_SIZE,
+          page: currentPage
+        }
+      });
 
-    // Limpiar respuesta por si Moodle mandó basura debug de PHP
-    const reportData = (typeof moodleRaw.data === 'string') ? cleanMoodleResponse(moodleRaw.data) : moodleRaw.data;
-    const rows: any[] = reportData?.data?.rows || reportData?.rows || [];
-    console.log(`📊 Reporte Moodle: ${rows.length} filas totales. Enrolled: ${enrolledList.length} usuarios.`);
+      const reportData = (typeof moodleRaw.data === 'string') ? cleanMoodleResponse(moodleRaw.data) : moodleRaw.data;
+      const pageRows: any[] = reportData?.data?.rows || reportData?.rows || [];
+      rows = rows.concat(pageRows);
+      const totalRows = Number(reportData?.data?.totalrowcount ?? 0);
+
+      if (pageRows.length < REPORT_PAGE_SIZE || rows.length >= totalRows) {
+        hasMorePages = false;
+      } else {
+        currentPage++;
+      }
+    }
+    console.log(`📊 Reporte Moodle: ${rows.length} filas totales (${currentPage + 1} página(s)). Enrolled: ${enrolledList.length} usuarios.`);
     if (rows.length === 0) {
-      console.log(`🔍 Respuesta Moodle raw (primeros 500 chars):`, JSON.stringify(reportData).substring(0, 500));
+      console.log(`🔍 Reporte vacío: 0 filas tras ${currentPage + 1} página(s). Verificar reportid y permisos del token.`);
     }
 
     // Estructuras
@@ -519,8 +547,11 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
     // Registra un evento (timestamp en ms) en el día correspondiente de un usuario.
     // Mantiene firstTs/lastTs (primer y último acceso) y acumula CADA evento en events[]
     // para poder reconstruir las sesiones reales más adelante.
+    // IMPORTANTE: usa fecha LOCAL del servidor (no UTC) para coherencia con el filtro
+    // de horario de reconstruirMinutosSesion que usa getHours() (hora local).
     const registrarEvento = (agg: UserAgg, ts: number) => {
-      const fecha = new Date(ts).toISOString().split('T')[0];
+      const d = new Date(ts);
+      const fecha = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
       const idx = agg.diasDetalle.findIndex((dd) => dd.fecha === fecha);
       if (idx >= 0) {
         const dia = agg.diasDetalle[idx];
@@ -664,7 +695,9 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
     const logWsFunction = process.env.MOODLE_LOG_WSFUNCTION;
     if (logWsFunction) {
       try {
-        const ninetyDaysAgo = Math.floor(Date.now() / 1000) - (90 * 24 * 60 * 60);
+        const logWindowDays = Number(process.env.MOODLE_LOG_WINDOW_DAYS) || 180;
+        const windowStart = Math.floor(Date.now() / 1000) - (logWindowDays * 24 * 60 * 60);
+        console.log(`📅 Ventana de logs: últimos ${logWindowDays} días (configurable con MOODLE_LOG_WINDOW_DAYS)`);
         const logsResp = await axios.post(moodleConfig.wsUrl, null, {
           params: {
             wstoken: moodleConfig.moodleToken,
@@ -672,8 +705,8 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
             moodlewsrestformat: 'json',
             'courseids[0]': moodleCourseId,
             courseid: moodleCourseId,
-            since: ninetyDaysAgo,
-            date: ninetyDaysAgo,
+            since: windowStart,
+            date: windowStart,
             userid: 0,
           }
         });
@@ -705,12 +738,21 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       console.log('ℹ️ Sin feed de eventos (MOODLE_LOG_WSFUNCTION no definida): los minutos son estimación por acceso, no tiempo real.');
     }
 
+    let singleEventWarnings = 0;
     byUser.forEach((userAgg) => {
       let totalUsuario = 0;
+      // Usar horario del grupo del usuario; si no tiene, fallback al del curso
+      const horarioUsuario = scheduleByGroupName.get((userAgg.groupName || '').toLowerCase().trim()) || horarioCursoDefault;
 
       userAgg.diasDetalle.forEach((dia) => {
         const eventos = (dia.events && dia.events.length) ? dia.events : [dia.firstTs];
-        const minutosReales = reconstruirMinutosSesion(eventos, horarioCurso);
+
+        // Advertir cuando un día tiene un solo evento (resultará en 0 minutos)
+        if (eventos.length === 1) {
+          singleEventWarnings++;
+        }
+
+        const minutosReales = reconstruirMinutosSesion(eventos, horarioUsuario);
 
         dia.minutos = minutosReales;
         totalUsuario += minutosReales;
@@ -718,6 +760,9 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
 
       userAgg.minutosTotales = totalUsuario;
     });
+    if (singleEventWarnings > 0) {
+      console.warn(`⚠️ ${singleEventWarnings} día(s) con un solo evento registrado (= 0 minutos). Esto ocurre cuando Moodle solo registra un acceso sin actividad adicional.`);
+    }
 
     const out = Array.from(byUser.values());
     const collection = db.collection('asistencia');
@@ -734,7 +779,7 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       await collection.insertMany(docsToInsert);
     }
 
-    return res.json({ ok: true, mensaje: `Procesados ${out.length} usuarios con horario ${horarioCurso}`, data: out });
+    return res.json({ ok: true, mensaje: `Procesados ${out.length} usuarios (horario default: ${horarioCursoDefault}, ${scheduleByGroupName.size} grupos con horario propio)`, data: out });
 
   } catch (err: any) {
     console.error('❌ Error en /api/dailystats:', err?.message || err);
@@ -896,15 +941,27 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
     const usersFiltered = allUsers;
 
     const getDayName = (d: Date) => ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'][d.getDay()];
+
+    // Detectar si algún grupo tiene clases en sábado para incluirlo en el reporte
+    const haySabado = allSettings.some(s =>
+      Array.isArray(s.schedule) && s.schedule.some((sch: any) =>
+        (sch.day || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '') === 'sabado'
+      )
+    );
+
     const diasSemana: { fechaStr: string, diaNombre: string }[] = [];
     let loopDate = new Date(startStr + 'T12:00:00');
     const loopEnd = new Date(endStr + 'T12:00:00');
 
+    // Helper para fecha local YYYY-MM-DD (coherente con registrarEvento, evita desfase UTC)
+    const toLocalDateStr = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
     while (loopDate <= loopEnd) {
       const dayIdx = loopDate.getDay();
-      if (dayIdx >= 1 && dayIdx <= 5) {
+      // Lunes(1) a Viernes(5) siempre; Sábado(6) solo si algún grupo tiene clases ese día
+      if ((dayIdx >= 1 && dayIdx <= 5) || (dayIdx === 6 && haySabado)) {
         diasSemana.push({
-          fechaStr: loopDate.toISOString().split('T')[0],
+          fechaStr: toLocalDateStr(loopDate),
           diaNombre: getDayName(loopDate)
         });
       }
@@ -914,7 +971,8 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
     if (format === 'json') {
       const rowsData = usersFiltered.map((user: any) => {
         const gName = user.groupName || 'Sin Grupo';
-        const rule = allSettings.find(s => s.groupName === gName) || {} as any;
+        const gNameLower = gName.toLowerCase().trim();
+        const rule = allSettings.find(s => (s.groupName || '').toLowerCase().trim() === gNameLower) || {} as any;
 
         const objetivoDiario = Number(rule.minMinutesPerDay || defaultMin);
         const umbral = Number(rule.globalAttendancePercent || defaultThreshold);
@@ -929,6 +987,7 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
           nombre: user.nombre || user.usuario || 'Sin Nombre',
           grupo: gName,
           Lunes: 0, Martes: 0, Miércoles: 0, Jueves: 0, Viernes: 0,
+          ...(haySabado ? { 'Sábado': 0 } : {}),
           totalSemana: 0,
           estado: 'PENDIENTE',
           objetivo: objetivoDiario
@@ -960,6 +1019,8 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
           }
         });
 
+        base.totalSemana = totalUserMinutes;
+
         const metaSemanal = diasHabilesUsuario * objetivoDiario;
         if (diasHabilesUsuario === 0) {
           base.estado = 'N/A';
@@ -984,6 +1045,10 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
       usersByGroup[gName].push(u);
     });
 
+    // Columnas dinámicas según si hay sábado
+    const lastCol = haySabado ? 'H' : 'G';
+    const totalCols = haySabado ? 8 : 7;
+
     const drawHeader = (ws: ExcelJS.Worksheet, config: any) => {
       const logoPath = path.join(__dirname, 'assets', 'logo.png');
       if (fs.existsSync(logoPath)) {
@@ -1000,14 +1065,15 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
         { key: 'dni', width: 15 }, { key: 'nombre', width: 40 },
         { key: 'lunes', width: 15 }, { key: 'martes', width: 15 },
         { key: 'miercoles', width: 15 }, { key: 'jueves', width: 15 }, { key: 'viernes', width: 15 },
+        ...(haySabado ? [{ key: 'sabado', width: 15 }] : []),
       ];
 
-      ws.mergeCells('A3:G3'); ws.getCell('A3').value = 'CONTROL DE ASISTENCIA SEMANAL';
+      ws.mergeCells(`A3:${lastCol}3`); ws.getCell('A3').value = 'CONTROL DE ASISTENCIA SEMANAL';
       ws.getCell('A3').alignment = { horizontal: 'center', vertical: 'middle' };
       ws.getCell('A3').font = { name: 'Arial', size: 14, bold: true, underline: true };
 
       const mes = start.toLocaleString('es-ES', { month: 'long' });
-      ws.mergeCells('A4:G4'); ws.getCell('A4').value = `SEMANA DEL ${start.getDate()} al ${end.getDate()} de ${mes.toUpperCase()} de ${start.getFullYear()}`;
+      ws.mergeCells(`A4:${lastCol}4`); ws.getCell('A4').value = `SEMANA DEL ${start.getDate()} al ${end.getDate()} de ${mes.toUpperCase()} de ${start.getFullYear()}`;
       ws.getCell('A4').alignment = { horizontal: 'center' };
       ws.getCell('A4').font = { name: 'Arial', size: 11, bold: true };
 
@@ -1016,7 +1082,7 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
       ws.getCell('F6').value = `CIF ${entidadCif}`;
       ['A6', 'A7', 'F6'].forEach(c => ws.getCell(c).font = { size: 9, bold: true });
 
-      ws.mergeCells('A9:G9'); ws.getCell('A9').value = `ESPECIALIDAD FORMATIVA: ${courseName.toUpperCase()}`;
+      ws.mergeCells(`A9:${lastCol}9`); ws.getCell('A9').value = `ESPECIALIDAD FORMATIVA: ${courseName.toUpperCase()}`;
       ws.getCell('A9').font = { size: 9, bold: true };
 
       ws.mergeCells('A10:B10'); ws.getCell('A10').value = `FECHA INICIO: ${fInicio}`;
@@ -1040,7 +1106,8 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
       const safeSheetName = groupName.replace(/[\/\\\?\*\]\[]/g, '').substring(0, 30);
       const ws = wb.addWorksheet(safeSheetName);
 
-      const rule = allSettings.find(s => s.groupName === groupName) || {} as any;
+      const groupNameLower = groupName.toLowerCase().trim();
+      const rule = allSettings.find(s => (s.groupName || '').toLowerCase().trim() === groupNameLower) || {} as any;
       const objDiario = Number(rule.minMinutesPerDay || defaultMin);
       const feriados = Array.isArray(rule.holidays) ? rule.holidays : [];
 
@@ -1084,7 +1151,7 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
       ws.getCell(`A${headerRowIdx}`).value = 'D.N.I.';
       ws.getCell(`B${headerRowIdx}`).value = 'NOMBRE Y APELLIDOS';
 
-      const colMap: any = { 0: 'C', 1: 'D', 2: 'E', 3: 'F', 4: 'G' };
+      const colMap: any = { 0: 'C', 1: 'D', 2: 'E', 3: 'F', 4: 'G', 5: 'H' };
       diasSemana.forEach((dia, index) => {
         if (colMap[index]) {
           const currentD = new Date(dia.fechaStr + 'T12:00:00');
@@ -1100,7 +1167,8 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
       });
 
       const tableHeaderStyle = { font: { bold: true, size: 9 }, alignment: { horizontal: 'center', vertical: 'middle' }, border: { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } } };
-      ['A', 'B', 'C', 'D', 'E', 'F', 'G'].forEach(col => {
+      const headerCols = haySabado ? ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'] : ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+      headerCols.forEach(col => {
         ws.getCell(`${col}${headerRowIdx}`).style = tableHeaderStyle as any;
         ws.getCell(`${col}${subHeaderRowIdx}`).style = tableHeaderStyle as any;
         if (col === 'A' || col === 'B') ws.mergeCells(`${col}${headerRowIdx}:${col}${subHeaderRowIdx}`);
@@ -1149,7 +1217,7 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
           }
         });
 
-        for (let c = 1; c <= 7; c++) {
+        for (let c = 1; c <= totalCols; c++) {
           row.getCell(c).border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
         }
         currentRow++;
@@ -1277,8 +1345,11 @@ app.get('/api/reports/daily-export', async (req: any, res: any) => {
       const rawGroup = (user.groupName ?? user.grupo ?? user.group);
       const grupo = (typeof rawGroup === 'string' && rawGroup.trim()) ? rawGroup.trim() : 'Sin Grupo';
 
-      // Buscar Regla
-      const rule = allSettings.find(s => s.groupName === grupo || s.groupId === grupo) || {} as any;
+      // Buscar Regla (case-insensitive para robustez)
+      const grupoLower = grupo.toLowerCase().trim();
+      const rule = allSettings.find(s =>
+        (s.groupName || '').toLowerCase().trim() === grupoLower || s.groupId === grupo
+      ) || {} as any;
 
       const objetivo = Number(rule.minMinutesPerDay || defaultMin);
       const horario = rule.scheduleTime || defaultSchedule;
@@ -1294,9 +1365,18 @@ app.get('/api/reports/daily-export', async (req: any, res: any) => {
       try {
         if (horario && horario.includes('-')) {
           const parts = horario.split('-');
-          const clean = (s: string) => s.trim().replace('H', '').replace(':', '.');
-          limitStart = parseFloat(clean(parts[0]));
-          limitEnd = parseFloat(clean(parts[1]));
+          // Parsear "HH:MM" o "HHhMM" a hora decimal (09:30 → 9.5, 9H30 → 9.5)
+          // Coherente con parseHoraDecimal usada en reconstruirMinutosSesion
+          const toDecimalHour = (s: string) => {
+            const t = s.trim().replace(/H/gi, ':').replace(/\s/g, '');
+            const m = t.match(/^(\d{1,2})[:.](\d{1,2})$/);
+            if (m) return parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+            const soloHora = t.match(/^(\d{1,2})$/);
+            if (soloHora) return parseInt(soloHora[1], 10);
+            return 0;
+          };
+          limitStart = toDecimalHour(parts[0]);
+          limitEnd = toDecimalHour(parts[1]);
         }
       } catch (e) { }
 
@@ -2973,36 +3053,4 @@ function reconstruirMinutosSesion(
   return Math.round(totalMs / 60_000);
 }
 
-function calcularMinutosEnHorario(primeraHora: Date, ultimaHora: Date, horarioTexto: string): number {
-  if (primeraHora.getTime() === ultimaHora.getTime()) return 0;
-
-  let horaInicioPermitida = 0;
-  let horaFinPermitida = 24;
-
-  try {
-    if (horarioTexto && horarioTexto.includes('-')) {
-      const partes = horarioTexto.split('-');
-      const inicioStr = partes[0].trim().replace('H', '').replace(':', '.'); // "09.00"
-      const finStr = partes[1].trim().replace('H', '').replace(':', '.');    // "14.00"
-      horaInicioPermitida = parseFloat(inicioStr);
-      horaFinPermitida = parseFloat(finStr);
-    }
-  } catch (e) {
-    console.log("Error parseando horario, usando default total");
-  }
-
-  const getDecimalTime = (d: Date) => d.getHours() + (d.getMinutes() / 60);
-
-  const inicioReal = getDecimalTime(primeraHora);
-  const finReal = getDecimalTime(ultimaHora);
-
-  const inicioEfectivo = Math.max(inicioReal, horaInicioPermitida);
-  const finEfectivo = Math.min(finReal, horaFinPermitida);
-
-  if (finEfectivo > inicioEfectivo) {
-    const diferenciaHoras = finEfectivo - inicioEfectivo;
-    return Math.round(diferenciaHoras * 60);
-  }
-
-  return 0;
-}
+// calcularMinutosEnHorario eliminada — era código muerto reemplazado por reconstruirMinutosSesion.

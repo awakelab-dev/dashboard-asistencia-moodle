@@ -20,11 +20,31 @@ export function ReportesView({ courseData, onBack }: ReportesViewProps) {
   const [fechaDia, setFechaDia] = useState('');
 
   const [loading, setLoading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState('');
   const [vistaPreviaData, setVistaPreviaData] = useState<any[]>([]);
   const [mensaje, setMensaje] = useState('');
 
   const objetivoDiario = Number(courseData.minMinutes || 170);
   const [userSearch, setUserSearch] = useState('');
+
+  // SINCRONIZAR DATOS DESDE MOODLE
+  const handleSyncMoodle = async () => {
+    setSyncing(true);
+    setSyncMsg('');
+    try {
+      await axios.get(`/api/dailystats/${courseData.courseId}`, {
+        params: { courseShortname: courseData.shortname }
+      });
+      setSyncMsg('✅ Datos sincronizados correctamente.');
+      setTimeout(() => setSyncMsg(''), 4000);
+    } catch (err: any) {
+      const detalle = err?.response?.data?.detalle || err?.response?.data?.error || err?.message;
+      setSyncMsg(`❌ Error al sincronizar${detalle ? `: ${detalle}` : ''}`);
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   // 1. CARGAR GRUPOS AL INICIAR
   useEffect(() => {
@@ -156,12 +176,30 @@ export function ReportesView({ courseData, onBack }: ReportesViewProps) {
               <h2 className="m-0 fw-bold text-shadow">{courseData.fullname}</h2>
             </div>
           </div>
-          <div className="d-none d-md-block text-white text-end opacity-75">
-            <div className="small"><i className="fa-solid fa-users me-1"></i> Grupos: {grupos.length}</div>
-            <div className="small"><i className="fa-regular fa-clock me-1"></i> Obj: {objetivoDiario}m</div>
+          <div className="d-flex align-items-center gap-3">
+            <div className="d-none d-md-block text-white text-end opacity-75">
+              <div className="small"><i className="fa-solid fa-users me-1"></i> Grupos: {grupos.length}</div>
+              <div className="small"><i className="fa-regular fa-clock me-1"></i> Obj: {objetivoDiario}m</div>
+            </div>
+            <Button
+              variant="light"
+              size="sm"
+              className="rounded-pill shadow-sm fw-bold"
+              onClick={handleSyncMoodle}
+              disabled={syncing}
+              title="Sincronizar datos desde Moodle"
+            >
+              {syncing
+                ? <><Spinner as="span" animation="border" size="sm" className="me-1" />Sincronizando...</>
+                : <><i className="fa-solid fa-rotate me-1"></i>Sincronizar</>
+              }
+            </Button>
           </div>
         </div>
       </div>
+
+      {/* MENSAJE SYNC */}
+      {syncMsg && <Alert variant={syncMsg.includes('✅') ? 'success' : 'danger'} className="mx-3 mb-2" dismissible onClose={() => setSyncMsg('')}>{syncMsg}</Alert>}
 
       {/* CONTROLES */}
       <Card className="mb-4 shadow-sm border-0" style={{ marginTop: '-30px', marginLeft: '15px', position: 'relative', zIndex: 10 }}>

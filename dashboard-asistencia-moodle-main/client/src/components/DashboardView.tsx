@@ -480,6 +480,23 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
         });
     };
 
+    // Sync explícito con feedback visual (botón dedicado en la tarjeta)
+    const handleExplicitSync = async (course: RegisteredCourse, e: React.MouseEvent) => {
+        e.stopPropagation();
+        setSyncingId(course.courseId);
+        try {
+            await axios.get(`/api/dailystats/${course.courseId}`, {
+                params: { courseShortname: course.shortname }
+            });
+            alert(`✅ Datos de "${course.shortname}" sincronizados correctamente.`);
+        } catch (error: any) {
+            const detalle = error?.response?.data?.detalle || error?.response?.data?.error || error?.message;
+            alert(`❌ Error al sincronizar${detalle ? `: ${detalle}` : ''}`);
+        } finally {
+            setSyncingId(null);
+        }
+    };
+
     const handleCardClick = async (course: RegisteredCourse) => {
         setSyncingId(course.courseId);
         try {
@@ -584,6 +601,11 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
                                         </div>
 
                                         <div className="d-flex gap-3 bg-light rounded px-2 py-1">
+                                            <i className={`fa-solid fa-rotate text-info icon-hover${syncingId === c.courseId ? ' fa-spin' : ''}`}
+                                                style={{ cursor: 'pointer', fontSize: '1rem' }}
+                                                onClick={(e) => handleExplicitSync(c, e)}
+                                                title="Sincronizar datos desde Moodle"
+                                            ></i>
                                             <i className="fa-solid fa-user-plus text-primary icon-hover icon-blue-hover"
                                                 style={{ cursor: 'pointer', fontSize: '1rem' }}
                                                 onClick={(e) => { e.stopPropagation(); syncCourseInBackground(c); setEnrolTargetCourse(c); setShowEnrolModal(true); }}
